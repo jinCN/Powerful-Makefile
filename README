@@ -1,0 +1,153 @@
+####                            SFOPRO build system（Stay Focused On Project Rather than On build system）——by 梁俊仁
+###                             为什么使用
+
+1 可维护性，重用性，自动化
+
+手写Makefile不仅繁琐，而且不具备可维护性和重用性。本构建系统无需维护Makefile，只需维护.rul文件（而.rul文件实际上往往是空文件），而且重用性强，只需要把.rul文件替换即可，人工干预几乎为0，一个make all自动生成根目录下所有子目录的目标。
+
+2 Nonrecursive Make（非递归Make）
+
+非递归Make很早就被证明性能上优于递归Make，适合用于大型工程（Recursive Make Considered Harmful，http://miller.emu.id.au/pmiller/books/rmch ）。但由于make的局限性，非递归Make不是内建的方法。可以参考Make的替代者Tup（Make vs Tup，http://gittup.org/tup/make_vs_tup.html ），内建了非递归构建方法。
+我们使用Make是因为它的使用最广泛，并且实现非递归无非是编写一个中间层（Implementing non-recursive make，http://evbergen.home.xs4all.nl/nonrecursive-make.html ）。
+
+3 目标依赖分析
+
+手写Makefile一般没有依赖分析，这对大型项目是致命的缺陷（除非你愿意不断地make clean）。依赖分析的目的很简单，只重新生成需要重新生成的文件。但Make是一个通用工具，不像Tup（Make vs Tup，http://gittup.org/tup/make_vs_tup.html ），Tup可以根据分析脚本中文件写操作自动产生文件的依赖变化，所以可以完美的解决这个问题。
+本构建系统参考了Tom Tromey 的 Auto-Dependency Generation（ http://make.mad-scientist.net/papers/advanced-auto-dependency-generation/ ）使用sed修改gcc -M选项的输出文件，结合若干小技巧，完美解决了C/C++头文件依赖自动解析。
+本构建系统参考了Target files depend on build scripts（ http://cr.yp.to/redo/honest-script.html ），解决了依赖于欲生成目标对Makefile的依赖解析（不完美），这很难做到修改Makefile的某个编译选项，只会重新生成与之相关的文件，但由于一个.rul文件分管一票目标，修改某个.rul文件后可以让这一票目标全部重新生成，而不影响其它目标。
+对于未创建目录的生成规则，没有使用冗余创建的方法（即反复调用mkdir保证目录已创建，这会造成很大性能损失），使用了目录创建依赖规则，这会为所有不存在的目录创建唯一的target，所有该目录下的target都依赖于此target。
+
+4 库依赖分析
+
+这也是递归Make做不好的一件事。我们期望如果项目中库A依赖于B，则B要先于A生成，而不能以Make进入哪个目录就先生成哪个，或者手工控制Make进入目录的顺序。
+本构建系统可以在任何规则解析前首先解析库依赖的DAG（无回路有向图 Directed Acyclic Graph），这样，由于"A依赖B"已记录在DAG中，Makefile的规则会保证B的生成先于A执行，无需人工干预。
+另外，分布式系统往往采用静态库而非动态库，本构建系统对库依赖也有独特的处理方式，未说明类型时，默认依赖静态库目标，找不到时采用动态库目标。在A依赖静态库B时，如果A是静态库，只会记录依赖关系，并不把B包含到A中，如果A是动态库或可执行文件，会将静态库B以及B所记录的依赖库全部包含进来（这通过Makefile的高级语法二次扩展实现（.SECONDEXPANSION:），第一次扩展时令A记录B以及所有B即将记录的依赖库（但还未记录），第二次扩展时进行所有静态库的依赖记录动作，之后若A不是静态库，A会使用记录的依赖项。之所以要使用二次扩展的高级语法，是因为此操作必须遍历DAG两次，而依赖项这个变量要作为prerequisite。）。
+
+5 集中化命令模板设置
+
+Makefile最终的任务无非就是按顺序执行一系列"gcc -o xx ..."命令，这些命令选项各不相同，但使用唯一的一个模板来配置所有这些选项是最好维护的（这通过Makefile的高级语法目标局部变量实现（Target-specific Variable））。
+
+
+###                             使用说明
+整个构建系统由.rul文件定义，还有一个特殊的文件TOP_RUL，标志着项目顶层目录      
+
+##                              基本概念
+.rul有两种格式：
+
+1 简单格式
+
+文件名作为目标名，文件内容设置该目标属性，如foo.rul:
+SRCS:=xxx.cpp
+TYPE:=exe
+这将编译本目录下xxx.cpp文件为一个可执行程序，名为foo
+
+2 完整格式
+
+.rul文件中只要设置了TARGETS变量，就属于完整格式，每个目标的属性用以下方式设置：
+CXXFLAGS:=-d
+TARGETS:=foo1 foo2
+define foo1
+TYPE:=shared
+SRCS:=f1.cpp
+DEPS:=.@foo2   #格式为 路径@库名
+endef
+define foo2
+SRCS:=f2.cpp
+endef
+这将编译两个库：静态库foo2（由f2.cpp编译成，使用gcc选项-d）和 动态库foo1（由f1.cpp编译并且链接foo2，使用gcc选项-d）
+由DEPS依赖关系解析出来的DAG（有向无环图）保证foo2先于foo1生成
+由于CXXFLAGS:=-d是本文件各target之外的部分，所以对本文件内所有target有效
+之所以foo2是静态库，是因为这里foo2没有设置TYPE，而DEFAULT_TYPE:=static
+
+
+##                              指导手册
+.rul中每个目标可设置的属性有TYPE SRCS SRCS_VPATH DEPS INCS CPPFLAGS CFLAGS CXXFLAGS ARFLAGS LDFLAGS PREBUILT_LIBS
+对于每个属性XX，其初始值为DEFAULT_XX，若用XX:=xx设置，则覆盖了初始值，若使用XX+=xx设置，则延续了初始值
+对于每个属性XX，有一个全局设置GLOBAL_XX，将会无条件追加到XX的最后
+
+以下为makefile中对于这些内容的全部设置
+DEFAULT_SRCS:= *.c *.C *.cc *.cp *.cpp *.CPP *.cxx *.c++
+DEFAULT_SRCS_VPATH:= src
+DEFAULT_INCS:=include
+DEFAULT_TYPE:=static shared
+GLOBAL_INCS:=$(TOP)
+
+#                               TYPE
+目标的类型：
+static
+编译打包成静态库
+shared
+编译链接成动态库（TYPE中可以既包含static又包含shared）
+exe
+编译链接成可执行文件
+prebuilt
+已编译好的库文件（可包含静态库动态库各一份，也可只包含一个）
+multi_prebuilt
+多个已编译好的库文件（可包含若干库的静态库和动态库，也可对于某些库只包含一种形式）
+
+#                               SRCS
+本目标的源，为c/c++源文件
+SRCS的内容将会在.rul目录以及SRCS_VPATH下进行wildcard
+
+#                               SRCS_VPATH
+配合SRCS
+
+#                               DEPS
+依赖的目标，其值必须是本构建系统定义的目标，若非prebuilt目标，请改用DEP_FLAGS
+DEPS声明的依赖是可以传递的，依赖分析结果会生成DAG（有向无环图）
+格式为 path@target[:type]
+或     path@target[:lib1;lib2;...]
+type为shared，static之一，若没有使用[:xxx]可选项，则按static>shared的顺序使用目标（multi_prebuilt目标则按照 所有静态库>所有动态库 顺序），第二种格式是专门针对prebuilt/multi_prebuilt库的，使用其中文件名为lib1 lib2 ... 的库
+
+#                               DEP_FLAGS
+与DEPS不同，将会直接成为gcc选项，-L选项后的目录名会被wildcard，不以-开头的都会被认定为文件名从而被wildcard
+DEP_FLAGS声明的依赖是可以传递的，依赖分析结果会生成DAG（有向无环图）
+
+#                               INCS
+本目标所有源文件的include-dir，会生成gcc的 -I选项，使用DEPS依赖其余目标后，最好在INCS中也包含那个目标的include-dir
+
+#                               CPPFLAGS
+预处理flags，对c c++都有效
+
+#                               CFLAGS
+c源文件编译flag，在编译动态库时，会自动加上-fPIC
+
+#                               CXXFLAGS
+c++源文件编译flag，在编译动态库时，会自动加上-fPIC
+
+#                               ARFLAGS
+打包程序ar使用的flag
+
+#                               LDFLAGS
+链接程序$(link)使用的flag，对于-l -L 和依赖文件 ，请从LDFLAGS移至DEP_FLAGS，这样可以参与依赖分析
+若没有c++源文件，则link:=gcc
+若有c++源文件，则link:=g++
+
+#                               PREBUILT_LIBS 
+专为TYPE为prebuilt或multi_prebuilt的目标设置，其值为预编译库的文件名
+若未设置，对于TYPE为prebuilt的目标，其值会缺省设置为目标目录下已存在的 lib[目标名].so lib[目标名].a
+         对于TYPE为multi_prebuilt的目标，其值会缺省设置为目标目录下已存在的 *.so *.a
+
+#                               TOP_RUL文件内容
+TOP_RUL文件全局唯一，可以直接在其中定义全局的设置，包括DEFAULT_XX GLOBAL_XX，如：
+GLOBAL_INCS:=// //thirdparty
+会让所有目标的头文件搜索路径包含顶层目录和thirdparty目录
+DEFAULT_SRCS_VPATH:= src
+会让所有目标的根据源文件名称搜索源文件的搜索路径在缺省情况下包含src
+GLOBAL_SRCS_VPATH:= src
+这样则会使非缺省情况下src都被包含到搜索路径中
+
+也可以在其中定义VERBOSE CONFIG（为允许在make时定义，所以在TOP_RUL中建议只定义缺省值，使用?=设置）
+
+#                               VERBOSE
+=1 显示所有原始命令行输出信息
+其余 显示缩略信息
+
+#                               CONFIG
+默认值 debug
+输出文件夹会以CONFIG来命名
+TOP_RUL可以根据不同的CONFIG设置不同的配置，如：
+ifeq ($(CONFIG),debug)
+GLOBAL_CPPFLAGS:=-g -ggdb
+endif
+在debug模式下，全局增加gcc生成调试信息的选项
